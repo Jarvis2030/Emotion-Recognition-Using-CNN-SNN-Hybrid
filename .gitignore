@@ -4,3 +4,6 @@ lava_nc-0.10.0/
 output_image/
 intro.pptx
 Working log.docx
+data/
+SNN-CNN.ipynb
+venv
