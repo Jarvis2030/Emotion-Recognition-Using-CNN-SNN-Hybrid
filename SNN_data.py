@@ -33,8 +33,8 @@ def load_data(
     test_ratio=0.2,
     random_state=42,
     num_channels=14,
-    window_size=384,     # e.g. 3 sec if fs=128
-    stride=384,          # non-overlap; set 192 for 50% overlap
+    window_size=128,     # e.g. 3 sec if fs=128
+    stride=128,          # non-overlap; set 192 for 50% overlap
     drop_last=True,      # whether to drop the last incomplete window
 ):
     """
@@ -374,6 +374,7 @@ def label_balancing(seg_eeg):
 
 
 # ===== test ======
-# df = mat_dataset_load()
+df = mat_dataset_load()
+print(df)
 # df = label_balancing(df)
 # train_dataset, valid_dataset, test_dataset = load_data(df)

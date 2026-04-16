@@ -19,16 +19,16 @@ from sklearn.model_selection import train_test_split
 
 fs = 128 #Hz
 
-class EEG2DCNN(nn.Module):
-    def __init__(self, n_classes=4, input_time=384, input_channels=14):
+class EEG_CNN_LTSM(nn.Module):
+    def __init__(self, n_classes=4, input_time=384, input_channels=14,  lstm_hidden=64, lstm_layers=1):
         super().__init__()
 
         self.features = nn.Sequential(
-            nn.Conv2d(1, 6, kernel_size=(64, 1)),
+            nn.Conv2d(1, 6, kernel_size=(25, 1)),
             nn.LeakyReLU(0.3, inplace=True),
             nn.Dropout(0.4),
 
-            nn.Conv2d(6, 6, kernel_size=(1, 3), stride=(1, 1), padding=(0, 1)),
+            nn.Conv2d(6, 6, kernel_size=(1, 7), stride=(1, 1), padding=(0, 1)),
             nn.BatchNorm2d(6),
             nn.LeakyReLU(0.3, inplace=True),
             nn.MaxPool2d(kernel_size=(2, 1)),
@@ -42,13 +42,65 @@ class EEG2DCNN(nn.Module):
             # nn.MaxPool2d(kernel_size=(2, 1)),
         )
 
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, input_time, input_channels)
+            feat = self.features(dummy)
+            # flat_dim = feat.view(1, -1).shape[1]
+            C_feat, H_feat, W_feat = feat.shape[1:]
+             
+        # 我們把 W_feat 平均掉，只保留時間方向 H_feat 當作序列長度
+        self.C_feat = C_feat
+        self.H_feat = H_feat
+        self.W_feat = W_feat
+             
+        # LSTM input_size = C_feat（每個 time step 的 feature 維度）
+        self.lstm = nn.LSTM(
+            input_size=C_feat,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=False
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(lstm_hidden, 8),
+            nn.LeakyReLU(0.3, inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(8, n_classes)
+        )
+
+
+class EEG2DCNN(nn.Module):
+    def __init__(self, n_classes=4, input_time=384, input_channels=14):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 6, kernel_size=(25, 1)),
+            nn.LeakyReLU(0.3, inplace=True),
+            nn.Dropout(0.4),
+
+            nn.Conv2d(6, 6, kernel_size=(1, 7), stride=(1, 1), padding=(0, 1)),
+            nn.BatchNorm2d(6),
+            nn.LeakyReLU(0.3, inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(6, 12, kernel_size=(25, 1)),
+            nn.LeakyReLU(0.3, inplace=True),
+            nn.Dropout(0.4),
+
+            nn.Conv2d(12, 12, kernel_size=(1, 7), stride=(1, 1), padding=(0, 1)),
+            nn.BatchNorm2d(12),
+            nn.LeakyReLU(0.3, inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+        )
+
         with torch.no_grad():
             dummy = torch.zeros(1, 1, input_time, input_channels)
             feat = self.features(dummy)
             flat_dim = feat.view(1, -1).shape[1]
+             
 
         self.classifier = nn.Sequential(
-            nn.Flatten(),
             nn.Linear(flat_dim, 8),
             nn.LeakyReLU(0.3, inplace=True),
             nn.Dropout(0.5),
@@ -56,9 +108,9 @@ class EEG2DCNN(nn.Module):
         )
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
+        x = self.features(x)          
+        logits = self.classifier(x)    # (batch, n_classes)
+        return logits
     
 class CNNBench(nn.Module):
     """Hybrid CNN-SNN for binary classification of multi-channel time-series data.
