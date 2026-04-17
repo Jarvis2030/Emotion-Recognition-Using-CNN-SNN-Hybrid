@@ -72,39 +72,40 @@ class EEG_CNN_LTSM(nn.Module):
 
 
 class EEG2DCNN(nn.Module):
-    def __init__(self, n_classes=4, input_time=384, input_channels=14):
+    def __init__(self, n_classes=4, input_time=384, in_channels = 1, eeg_channels=14):
         super().__init__()
 
         self.features = nn.Sequential(
-            nn.Conv2d(1, 6, kernel_size=(64, 1)),
-            nn.LeakyReLU(0.3, inplace=True),
+            nn.Conv2d(in_channels, 10, kernel_size=(eeg_channels, 1)),
+            # nn.LeakyReLU(0.3, inplace=True),
             nn.Dropout(0.4),
 
-            nn.Conv2d(6, 6, kernel_size=(1, 3), stride=(1, 1), padding=(0, 1)),
-            nn.BatchNorm2d(6),
-            nn.LeakyReLU(0.3, inplace=True),
+            nn.Conv2d(10, 10, kernel_size=(1, 3), stride=(1, 1), padding=(0, 1)),
+            nn.BatchNorm2d(10),
+            # nn.LeakyReLU(0.3, inplace=True),
             nn.MaxPool2d(kernel_size=(2, 1)),
-            # nn.Conv2d(6, 12, kernel_size=(25, 1)),
-            # nn.LeakyReLU(0.3, inplace=True),
-            # nn.Dropout(0.4),
 
-            # nn.Conv2d(12, 12, kernel_size=(1, 7), stride=(1, 1), padding=(0, 1)),
-            # nn.BatchNorm2d(12),
+            nn.Conv2d(10, 12, kernel_size=(25, 1)),
             # nn.LeakyReLU(0.3, inplace=True),
-            # nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Dropout(0.4),
+
+            nn.Conv2d(12, 12, kernel_size=(1, 7), stride=(1, 1), padding=(0, 1)),
+            nn.BatchNorm2d(12),
+            # nn.LeakyReLU(0.3, inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 1)),
         )
 
         with torch.no_grad():
-            dummy = torch.zeros(1, 1, input_time, input_channels)
+            dummy = torch.zeros(1, in_channels, input_time, eeg_channels)
             feat = self.features(dummy)
             flat_dim = feat.view(1, -1).shape[1]
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(flat_dim, 8),
+            nn.Linear(flat_dim, 10),
             nn.LeakyReLU(0.3, inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(8, n_classes)
+            nn.Linear(10, n_classes)
         )
 
     def forward(self, x):
@@ -281,8 +282,6 @@ class SNNEMotionNet(nn.Module):
         self.spike_mon_enc = None   # 用來暫存 spike
         self.spike_mon_snn1 = None  
         self.spike_mon_snn2 = None   
-
-
 
     def forward(self, x):
         # print("Original Shape: ", x.shape)

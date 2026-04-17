@@ -14,6 +14,71 @@ from sklearn.model_selection import train_test_split
 fs = 128 # Hz, change if needed
 
 
+import torch
+from torch.utils.data import Dataset
+import ast
+
+def parse_eeg_str(s):
+    if isinstance(s, (list, np.ndarray)):
+        return np.asarray(s, dtype=np.float32)
+    # 去除空白，處理成 python literal
+    try:
+        arr = np.array(ast.literal_eval(s), dtype=np.float32)
+    except Exception:
+        # 如果不是標準 list 格式，改用逗點分割
+        arr = np.array([float(x) for x in s.replace('[','').replace(']','').split(',')], 
+                       dtype=np.float32)
+    return arr
+
+# =============================================================================
+# Data Augmentation
+# =============================================================================
+class EEGAugmentDataset(Dataset):
+    def __init__(self, base_dataset,
+                 noise_std=0.01,
+                 amp_scale_range=(0.9, 1.1),
+                 max_shift_ratio=0.05):
+        """
+        base_dataset: 原本的 TensorDataset(x, y, tid)
+        noise_std:    噪音強度比例 (乘以每個樣本的 std)
+        amp_scale_range: 幅度縮放範圍 (min, max)
+        max_shift_ratio: 最多平移多少比例的時間長度 (例如 0.05 = 5%)
+
+        注意: 只用在 training dataloader 上，valid / test 不要用這個包。
+        """
+        self.base = base_dataset
+        self.noise_std = noise_std
+        self.amp_scale_range = amp_scale_range
+        self.max_shift_ratio = max_shift_ratio
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        x, y, tid = self.base[idx]  # x: (C_in, T, ?) 依你現在的設定是 (9, C, T) 或 (9, T, C)
+
+        # 只在訓練時做 augmentation，這個 class 本來就只會用在 train_loader
+        x_aug = x.clone()
+
+        # 假設 x_aug shape = (C_in, T, C_eeg)
+        # 若你之後有 permute，這裡仍然是 (channels, time, electrodes)
+
+        # 1) amplitude scaling
+        if self.amp_scale_range is not None:
+            low, high = self.amp_scale_range
+            scale = torch.empty(1).uniform_(low, high)
+            x_aug = x_aug * scale
+
+        # 2) 加小高斯噪音 (jitter)
+        if self.noise_std is not None and self.noise_std > 0:
+            # 以每個 sample 的 std 當基準
+            std = x_aug.std()
+            noise = torch.randn_like(x_aug) * (self.noise_std * std)
+            x_aug = x_aug + noise
+
+        return x_aug, y, tid
+
+
 # =============================================================================
 # Data loading — MODIFY THIS FOR YOUR DATASET
 # =============================================================================
@@ -22,6 +87,8 @@ def load_data(
     train_ratio=0.6,
     valid_ratio=0.2,
     test_ratio=0.2,
+    s_time = 10, # trim time start
+    e_time = 10, # trim time end
     random_state=42,
     num_channels=14,
     window_size=384,     # e.g. 3 sec if fs=128
@@ -62,28 +129,36 @@ def load_data(
     df = df.copy()
     df = df.sort_values(["subject", "video", "channel"]).reset_index(drop=True)
 
+
+
+
     # -----------------------------
     # 1) segment full EEG trial first
     #    output rows: subject, video, channel, segment, EEG_segment, label
     # -----------------------------
     segmented_rows = []
 
-    trial_group_cols = ["subject", "video", "channel"]
+    trial_group_cols = ["subject", "video", "channel", "session_idx"]
     grouped_trial_channel = df.groupby(trial_group_cols)
 
-    for (sub, vid, ch), g in grouped_trial_channel:
+    for (sub, vid, ch, ses), g in grouped_trial_channel:
         if len(g) != 1:
             raise ValueError(
-                f"(subject={sub}, video={vid}, channel={ch}) has {len(g)} rows. "
+                f"(subject={sub}, video={vid}, channel={ch}, session={ses}) has {len(g)} rows. "
                 "Expected exactly 1 row per full-trial channel."
             )
 
         full_signal = np.asarray(g.iloc[0]["EEG_clean"], dtype=np.float32)
         label = int(g.iloc[0]["label"])
 
+        # ============= Trim off the first 10 and the last 10 second =============
+        start = fs* s_time
+        end = fs* e_time
+        full_signal = full_signal[start:-end]
+
         if full_signal.ndim != 1:
             raise ValueError(
-                f"(subject={sub}, video={vid}, channel={ch}) full EEG must be 1D, "
+                f"(subject={sub}, video={vid}, channel={ch}), session={ses} full EEG must be 1D, "
                 f"got shape {full_signal.shape}"
             )
 
@@ -147,10 +222,10 @@ def load_data(
     #    one row becomes one (subject, video, segment)
     # -----------------------------
     df_segch = df_segch.sort_values(
-        ["subject", "video", "segment", "channel"]
+        ["subject", "video", "segment", "channel",  "session_idx"]
     ).reset_index(drop=True)
 
-    group_cols = ["subject", "video", "segment"]
+    group_cols = ["subject", "video", "segment",  "session_idx"]
     grouped = df_segch.groupby(group_cols)
 
     rows = []
@@ -216,6 +291,8 @@ def load_data(
         shuffle=True,
     )
 
+    df["trial_id"] = df["subject"] * 1000 + df["video"]   #adding trial id for trial-based validation
+
     train_df = df[df["group_id"].isin(train_groups)].copy()
     valid_df = df[df["group_id"].isin(valid_groups)].copy()
     test_df  = df[df["group_id"].isin(test_groups)].copy()
@@ -230,6 +307,7 @@ def load_data(
 
         x_list = []
         y_list = []
+        tid_list = []
 
         for _, row in split_df.iterrows():
             x = np.asarray(row["EEG_array"], dtype=np.float32)   # (C, T_window)
@@ -245,17 +323,30 @@ def load_data(
 
             x_list.append(featured_x)
             y_list.append(int(row["label"]))
+            tid_list.append(int(row["trial_id"]))
 
         x = np.stack(x_list, axis=0)   # (N, C, T)
         y = np.asarray(y_list, dtype=np.int64)
+        tids = np.asarray(tid_list, dtype=np.int64)
 
         x_tensor = torch.from_numpy(x).float()
         y_tensor = torch.from_numpy(y).long()
-        return TensorDataset(x_tensor, y_tensor)
+        tid_tensor = torch.from_numpy(tids).long()
+
+        return TensorDataset(x_tensor, y_tensor, tid_tensor)
 
     train_dataset = df_to_dataset(train_df)
     valid_dataset = df_to_dataset(valid_df)
     test_dataset  = df_to_dataset(test_df)
+
+     # data augmentation
+    print("Run data augmentation")
+    train_dataset = EEGAugmentDataset(
+        train_dataset,
+        noise_std=0.01,             # 先從很小開始
+        amp_scale_range=(0.9, 1.1),
+        max_shift_ratio=0.05        # 最多平移 5% 的時間長度
+    )
 
     # -----------------------------
     # 6) infer input channels
@@ -445,11 +536,26 @@ def EEG_band_analysis(fs, seg, freq_bend = [(1,4), (4,8), (8,13), (13,30)], out_
 
     # Stack back to the 3D shape
     featured_x = np.stack(band_list, axis=0)
-    print(featured_x.shape)
     return featured_x  # [9, C, T]
 
 
+
 # ===== test ======
-# df = mat_dataset_load()
+# # restructure seed to distinguish each session
+# seed = pd.read_csv('/Users/linyuchun/Desktop/Project/SNN/data/EEG_all_sessions_combined.csv')
+# seed = seed.sort_values(["subject", "video", "channel"]).reset_index(drop=True)
+
+# # 對每個 (subject, video, channel) 計算它出現的次數順序 0,1,2 -> session index
+# seed["session_idx"] = seed.groupby(["subject", "video", "channel"]).cumcount()
+# seed["EEG_clean"] = seed["EEG_clean"].apply(parse_eeg_str)
+
+# dreamer = mat_dataset_load()
+
+# # Add a columns to distingish the db
+# dreamer["session_idx"] = -1
+# dreamer["dataset"] = "dreamer"
+# seed["dataset"] = "seed"
+
+# df = pd.concat([dreamer, seed], axis=0, ignore_index=True)
 # df = label_balancing(df)
 # train_dataset, valid_dataset, test_dataset = load_data(df)
