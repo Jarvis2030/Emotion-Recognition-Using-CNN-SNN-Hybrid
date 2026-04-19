@@ -31,7 +31,7 @@ def parse_eeg_str(s):
     return arr
 
 # =============================================================================
-# Data Augmentation
+# Data Augmentation (If needed)
 # =============================================================================
 class EEGAugmentDataset(Dataset):
     def __init__(self, base_dataset,
@@ -43,8 +43,6 @@ class EEGAugmentDataset(Dataset):
         noise_std:    噪音強度比例 (乘以每個樣本的 std)
         amp_scale_range: 幅度縮放範圍 (min, max)
         max_shift_ratio: 最多平移多少比例的時間長度 (例如 0.05 = 5%)
-
-        注意: 只用在 training dataloader 上，valid / test 不要用這個包。
         """
         self.base = base_dataset
         self.noise_std = noise_std
@@ -55,13 +53,9 @@ class EEGAugmentDataset(Dataset):
         return len(self.base)
 
     def __getitem__(self, idx):
-        x, y, tid = self.base[idx]  # x: (C_in, T, ?) 依你現在的設定是 (9, C, T) 或 (9, T, C)
+        x, y, tid = self.base[idx]  #
 
-        # 只在訓練時做 augmentation，這個 class 本來就只會用在 train_loader
         x_aug = x.clone()
-
-        # 假設 x_aug shape = (C_in, T, C_eeg)
-        # 若你之後有 permute，這裡仍然是 (channels, time, electrodes)
 
         # 1) amplitude scaling
         if self.amp_scale_range is not None:
@@ -69,7 +63,7 @@ class EEGAugmentDataset(Dataset):
             scale = torch.empty(1).uniform_(low, high)
             x_aug = x_aug * scale
 
-        # 2) 加小高斯噪音 (jitter)
+        # 2) Gaussian Noise
         if self.noise_std is not None and self.noise_std > 0:
             # 以每個 sample 的 std 當基準
             std = x_aug.std()
@@ -87,38 +81,30 @@ def load_data(
     train_ratio=0.6,
     valid_ratio=0.2,
     test_ratio=0.2,
-    s_time = 10, # trim time start
-    e_time = 10, # trim time end
     random_state=42,
     num_channels=14,
-    window_size=384,     # e.g. 3 sec if fs=128
-    stride=384,          # non-overlap; set 192 for 50% overlap
-    drop_last=True,      # whether to drop the last incomplete window
+    window_size=384,   # e.g. 3 sec if fs=128
+    stride=384,        # non-overlap; set 192 for 50% overlap
+    drop_last=True,
 ):
     """
-    Input df:
-        one row = one channel of one full EEG trial
-
-    Expected columns:
-        - subject
-        - video
-        - channel
-        - EEG_array   : full 1D EEG signal of that channel, shape (T_full,)
-        - label
-
-    Pipeline:
-        1. segment each full trial signal into windows
-        2. stack 14 channels into 2D EEG_array of shape (C, T_window)
-        3. split by (subject, video), so all segments from one trial stay together
-
-    Returns:
-        train_dataset, valid_dataset, test_dataset, in_channels
+    需要欄位:
+      - dataset      (e.g. 'dreamer', 'seed')
+      - subject
+      - video
+      - channel
+      - session_idx
+      - EEG_clean    : 1D array-like of shape (T_full,)
+      - label
     """
 
     # -----------------------------
     # 0) basic checks
     # -----------------------------
-    required_cols = {"subject", "video", "channel", "EEG_clean", "label"}
+    required_cols = {
+        "dataset", "subject", "video", "channel",
+        "session_idx", "EEG_clean", "label"
+    }
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
@@ -127,55 +113,50 @@ def load_data(
         raise ValueError("train_ratio + valid_ratio + test_ratio must equal 1.0")
 
     df = df.copy()
-    df = df.sort_values(["subject", "video", "channel"]).reset_index(drop=True)
-
-
-
+    df = df.sort_values(
+        ["dataset", "subject", "session_idx", "video", "channel"]
+    ).reset_index(drop=True)
 
     # -----------------------------
-    # 1) segment full EEG trial first
-    #    output rows: subject, video, channel, segment, EEG_segment, label
+    # 1) segment full EEG trial
     # -----------------------------
     segmented_rows = []
 
-    trial_group_cols = ["subject", "video", "channel", "session_idx"]
+    trial_group_cols = ["dataset", "subject", "session_idx", "video", "channel"]
     grouped_trial_channel = df.groupby(trial_group_cols)
 
-    for (sub, vid, ch, ses), g in grouped_trial_channel:
+    for (dset, sub, ses, vid, ch), g in grouped_trial_channel:
         if len(g) != 1:
             raise ValueError(
-                f"(subject={sub}, video={vid}, channel={ch}, session={ses}) has {len(g)} rows. "
-                "Expected exactly 1 row per full-trial channel."
+                f"(dataset={dset}, subject={sub}, session={ses}, "
+                f"video={vid}, channel={ch}) has {len(g)} rows, "
+                "expected 1 row per full-trial channel."
             )
 
         full_signal = np.asarray(g.iloc[0]["EEG_clean"], dtype=np.float32)
         label = int(g.iloc[0]["label"])
 
-        # ============= Trim off the first 10 and the last 10 second =============
-        start = fs* s_time
-        end = fs* e_time
-        full_signal = full_signal[start:-end]
 
         if full_signal.ndim != 1:
             raise ValueError(
-                f"(subject={sub}, video={vid}, channel={ch}), session={ses} full EEG must be 1D, "
+                f"(dataset={dset}, subject={sub}, session={ses}, "
+                f"video={vid}, channel={ch}) full EEG must be 1D, "
                 f"got shape {full_signal.shape}"
             )
 
         T_full = len(full_signal)
 
-        # if the total length is smaller then 1 window
-        if T_full < window_size:
-            # remove incomplete window, length alignment
+        # if the signal is longer then window
+        if T_full < window_size: 
             if drop_last:
                 continue
-            
-            # add the padding to fill up the incomplete window
             else:
                 padded = np.zeros(window_size, dtype=np.float32)
                 padded[:T_full] = full_signal
                 segmented_rows.append({
+                    "dataset": dset,
                     "subject": sub,
+                    "session_idx": ses,
                     "video": vid,
                     "channel": ch,
                     "segment": 0,
@@ -184,16 +165,13 @@ def load_data(
                 })
                 continue
 
+        # Normal segmentation on grouping (sub, video, session_idx) -> make sure they are unique
         seg_idx = 0
         for start in range(0, T_full, stride):
             end = start + window_size
-            # Normal segment process
             if end <= T_full:
                 seg = full_signal[start:end]
-
-            # edge case
             else:
-                # remove any incomplete window, length alignment
                 if drop_last:
                     break
                 seg = np.zeros(window_size, dtype=np.float32)
@@ -203,7 +181,9 @@ def load_data(
                 seg[:valid_len] = full_signal[start:T_full]
 
             segmented_rows.append({
+                "dataset": dset,
                 "subject": sub,
+                "session_idx": ses,
                 "video": vid,
                 "channel": ch,
                 "segment": seg_idx,
@@ -213,27 +193,27 @@ def load_data(
             seg_idx += 1
 
     df_segch = pd.DataFrame(segmented_rows)
-
     if len(df_segch) == 0:
         raise ValueError("No segmented data generated. Check window_size/stride/drop_last.")
 
     # -----------------------------
     # 2) stack 14 channels -> 2D (C, T)
-    #    one row becomes one (subject, video, segment)
     # -----------------------------
     df_segch = df_segch.sort_values(
-        ["subject", "video", "segment", "channel",  "session_idx"]
+        ["dataset", "subject", "session_idx", "video", "segment", "channel"]
     ).reset_index(drop=True)
 
-    group_cols = ["subject", "video", "segment",  "session_idx"]
+    # Group all the segment by the previous set (sub, video, session)
+    group_cols = ["dataset", "subject", "session_idx", "video", "segment"]
     grouped = df_segch.groupby(group_cols)
 
     rows = []
-    for (sub, vid, seg), g in grouped:
+    for (dset, sub, ses, vid, seg), g in grouped:
         if len(g) != num_channels:
             raise ValueError(
-                f"(subject={sub}, video={vid}, segment={seg}) "
-                f"has {len(g)} channels, expected {num_channels}"
+                f"(dataset={dset}, subject={sub}, session={ses}, "
+                f"video={vid}, segment={seg}) has {len(g)} channels, "
+                f"expected {num_channels}"
             )
 
         signals = []
@@ -241,23 +221,25 @@ def load_data(
             sig = np.asarray(row["EEG_segment"], dtype=np.float32)
             if sig.ndim != 1:
                 raise ValueError(
-                    f"(subject={sub}, video={vid}, segment={seg}) "
-                    f"segment must be 1D, got shape {sig.shape}"
+                    f"(dataset={dset}, subject={sub}, session={ses}, "
+                    f"video={vid}, segment={seg}) segment must be 1D, got {sig.shape}"
                 )
             signals.append(sig)
 
         lengths = {len(s) for s in signals}
         if len(lengths) != 1:
             raise ValueError(
-                f"(subject={sub}, video={vid}, segment={seg}) "
-                f"channel segment lengths mismatch: {lengths}"
+                f"(dataset={dset}, subject={sub}, session={ses}, "
+                f"video={vid}, segment={seg}) channel lengths mismatch: {lengths}"
             )
 
         eeg_2d = np.stack(signals, axis=0)   # (C, T_window)
         label = int(g["label"].iloc[0])
 
         rows.append({
+            "dataset": dset,
             "subject": sub,
+            "session_idx": ses,
             "video": vid,
             "segment": seg,
             "EEG_array": eeg_2d,
@@ -267,71 +249,77 @@ def load_data(
     df = pd.DataFrame(rows)
 
     # -----------------------------
-    # 3) build group id = one full trial
+    # 3) build group_id & trial_id = one full trial
     # -----------------------------
-    df["group_id"] = df["subject"].astype(str) + "__" + df["video"].astype(str)
+    df["group_id"] = (
+        df["dataset"].astype(str) + "__"
+        + df["subject"].astype(str) + "__"
+        + df["session_idx"].astype(str) + "__"
+        + df["video"].astype(str)
+    )
+    df["trial_id"] = df["group_id"]  # trial-level 評估也用同一組 ID
+
     unique_groups = df["group_id"].unique()
 
     # -----------------------------
-    # 4) split by group, not by row
+    # 4) stratified split by group
     # -----------------------------
-    train_groups, temp_groups = train_test_split(
+    # 每個 group/trial 的 label
+    group_to_label = df.groupby("group_id")["label"].first()
+    unique_groups = group_to_label.index.values
+    group_labels = group_to_label.values
+
+    train_groups, temp_groups, train_y, temp_y = train_test_split(
         unique_groups,
+        group_labels,
         test_size=(1.0 - train_ratio),
         random_state=random_state,
         shuffle=True,
+        stratify=group_labels,
     )
 
     valid_portion_of_temp = valid_ratio / (valid_ratio + test_ratio)
-
     valid_groups, test_groups = train_test_split(
         temp_groups,
         test_size=(1.0 - valid_portion_of_temp),
         random_state=random_state,
         shuffle=True,
+        stratify=temp_y,
     )
-
-    df["trial_id"] = df["subject"] * 1000 + df["video"]   #adding trial id for trial-based validation
 
     train_df = df[df["group_id"].isin(train_groups)].copy()
     valid_df = df[df["group_id"].isin(valid_groups)].copy()
     test_df  = df[df["group_id"].isin(test_groups)].copy()
 
-
     # -----------------------------
-    # 5) Convert table -> tensors
+    # 5) table -> tensors
     # -----------------------------
     def df_to_dataset(split_df):
         if len(split_df) == 0:
             raise ValueError("One split is empty. Adjust split ratios or dataset size.")
 
-        x_list = []
-        y_list = []
-        tid_list = []
+        x_list, y_list, tid_list = [], [], []
 
         for _, row in split_df.iterrows():
             x = np.asarray(row["EEG_array"], dtype=np.float32)   # (C, T_window)
-
             if x.ndim != 2:
-                raise ValueError(
-                    f"Each EEG_array must have shape (C, T), got shape {x.shape}"
-                )
-            
-            # ===== EEG_band_analysis =====
-            featured_x = EEG_band_analysis(fs=fs, seg=x, out_T=window_size)
+                raise ValueError(f"Each EEG_array must have shape (C, T), got {x.shape}")
 
-
+            # Adding EEG band (delta, gamma, alpha, etc) and STFT PSD analysis
+            featured_x = EEG_band_analysis(fs=fs, seg=x, out_T=window_size)  # (9, C, T)
             x_list.append(featured_x)
             y_list.append(int(row["label"]))
-            tid_list.append(int(row["trial_id"]))
+            tid_list.append(row["trial_id"])   # 已經是字串，可以直接存
 
-        x = np.stack(x_list, axis=0)   # (N, C, T)
+        x = np.stack(x_list, axis=0)   # (N, 9, C, T)
         y = np.asarray(y_list, dtype=np.int64)
-        tids = np.asarray(tid_list, dtype=np.int64)
+        
+        _, tid_ints = np.unique(tid_list, return_inverse=True)
+        tids = tid_ints.astype(np.int64)
 
         x_tensor = torch.from_numpy(x).float()
         y_tensor = torch.from_numpy(y).long()
-        tid_tensor = torch.from_numpy(tids).long()
+        tid_tensor = torch.from_numpy(tids)
 
         return TensorDataset(x_tensor, y_tensor, tid_tensor)
 
@@ -339,14 +327,14 @@ def load_data(
     valid_dataset = df_to_dataset(valid_df)
     test_dataset  = df_to_dataset(test_df)
 
-     # data augmentation
-    print("Run data augmentation")
-    train_dataset = EEGAugmentDataset(
-        train_dataset,
-        noise_std=0.01,             # 先從很小開始
-        amp_scale_range=(0.9, 1.1),
-        max_shift_ratio=0.05        # 最多平移 5% 的時間長度
-    )
+    # augmentation only on train
+    # print("Run data augmentation")
+    # train_dataset = EEGAugmentDataset(
+    #     train_dataset,
+    #     noise_std=0.01,
+    #     amp_scale_range=(0.9, 1.1),
+    #     max_shift_ratio=0.05,
+    # )
 
     # -----------------------------
     # 6) infer input channels
@@ -384,30 +372,54 @@ def mat_dataset_load(path = '/Users/linyuchun/Desktop/Project/SNN/data/EEG_clean
     return seg_eeg
 
 def label_balancing(seg_eeg):
+    """
+    seg_eeg 至少需要欄位:
+      - dataset   (e.g. 'dreamer', 'seed')
+      - subject
+      - video
+      - label
+    若有多個 session, 建議多一欄 session_idx 一起納入 trial_id.
+    """
 
-    # 已有: seg_eeg，欄位至少有: subject, video, label
+    df = seg_eeg.copy()
 
-    # 1) 建立 trial_id
-    seg_eeg["trial_id"] = seg_eeg["subject"] * 1000 + seg_eeg["video"]
+    # 1) 建立 trial_id = dataset + subject + (session_idx) + video
+    if "session_idx" in df.columns:
+        df["trial_id"] = (
+            df["dataset"].astype(str) + "__"
+            + df["subject"].astype(str) + "__"
+            + df["session_idx"].astype(str) + "__"
+            + df["video"].astype(str)
+        )
+    else:
+        df["trial_id"] = (
+            df["dataset"].astype(str) + "__"
+            + df["subject"].astype(str) + "__"
+            + df["video"].astype(str)
+        )
 
-    # 2) 先在 trial level 建一個 df_trials，並算出每個 trial 的 label
-    #    這裡我用每個 trial 的第一個 segment 的 label（假設同一 trial 內 label 全部一樣）
+    # 2) trial level df: 一個 trial 一列
+    agg_dict = {
+        "dataset": "first",
+        "subject": "first",
+        "video": "first",
+        "label": "first",
+    }
+    if "session_idx" in df.columns:
+        agg_dict["session_idx"] = "first"
+
     df_trials = (
-        seg_eeg.groupby("trial_id")
-            .agg({
-                "subject": "first",
-                "video": "first",
-                "label": "first",
-            })
-            .reset_index()
+        df.groupby("trial_id")
+          .agg(agg_dict)
+          .reset_index()
     )
 
     print("df_trials (trial-level):")
     print(df_trials.head())
     print("len(df_trials) =", len(df_trials))
 
-    # 3) 在 trial level 做 4 類平衡
-    labels_trial = df_trials["label"].values  # 長度 = len(df_trials)
+    # 3) trial level 做 4 類平衡
+    labels_trial = df_trials["label"].values
 
     idx0 = np.where(labels_trial == 0)[0]
     idx1 = np.where(labels_trial == 1)[0]
@@ -420,7 +432,7 @@ def label_balancing(seg_eeg):
     n_per_class = min(n0, n1, n2, n3)
     print(f"Using {n_per_class} trials per class (total {4 * n_per_class}).")
 
-    # 完全不 random：直接取每一類的前 n_per_class 個 trial index（trial-level index）
+    # 這裡你可以改成 random 選，先沿用原來的前 n_per_class 個
     idx0_sel = idx0[:n_per_class]
     idx1_sel = idx1[:n_per_class]
     idx2_sel = idx2[:n_per_class]
@@ -430,20 +442,18 @@ def label_balancing(seg_eeg):
 
     print("keep_idx min/max:", keep_idx.min(), keep_idx.max())
 
-    # 這裡用的是 trial-level df_trials，所以 iloc 是安全的
     df_trials_bal = df_trials.iloc[keep_idx].reset_index(drop=True)
 
     print("Trial-level counts after balance:")
     print(df_trials_bal["label"].value_counts().sort_index())
 
-    # 4) 用保留下來的 trial_id 去 filter 原本 seg_eeg（一次 drop 掉整個 subject-video 的所有 channel/segment）
+    # 4) 回到 segment/channel level，用保留的 trial_id 篩選
     keep_trial_ids = df_trials_bal["trial_id"].values
-    mask_keep = seg_eeg["trial_id"].isin(keep_trial_ids)
-    df_bal = seg_eeg[mask_keep].reset_index(drop=True)
+    mask_keep = df["trial_id"].isin(keep_trial_ids)
+    df_bal = df[mask_keep].reset_index(drop=True)
 
     print("df_bal (segment/channel-level) shape:", df_bal.shape)
 
-    # 檢查 channel/segment-level 的 label 分布（用 merge 把 trial label 帶回來）
     df_bal_with_label = df_bal.merge(
         df_trials_bal[["trial_id", "label"]],
         on="trial_id",
@@ -454,10 +464,9 @@ def label_balancing(seg_eeg):
     print("Channel-level label counts after trial balancing:")
     print(df_bal_with_label["label_trial"].value_counts().sort_index())
 
-    df_bal_with_label = df_bal_with_label.drop(columns=["label_trial"])
-    seg_eeg = df_bal_with_label.drop(columns=["trial_id"])
+    df_bal_with_label = df_bal_with_label.drop(columns=["label_trial", "trial_id"])
 
-    return seg_eeg
+    return df_bal_with_label
 
 def EEG_band_analysis(fs, seg, freq_bend = [(1,4), (4,8), (8,13), (13,30)], out_T = 1):
     """

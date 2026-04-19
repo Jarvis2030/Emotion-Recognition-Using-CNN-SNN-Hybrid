@@ -77,21 +77,21 @@ class EEG2DCNN(nn.Module):
 
         self.features = nn.Sequential(
             nn.Conv2d(in_channels, 10, kernel_size=(eeg_channels, 1)),
-            # nn.LeakyReLU(0.3, inplace=True),
+            nn.LeakyReLU(0.3, inplace=True),
             nn.Dropout(0.4),
 
             nn.Conv2d(10, 10, kernel_size=(1, 3), stride=(1, 1), padding=(0, 1)),
             nn.BatchNorm2d(10),
-            # nn.LeakyReLU(0.3, inplace=True),
+            nn.LeakyReLU(0.3, inplace=True),
             nn.MaxPool2d(kernel_size=(2, 1)),
 
             nn.Conv2d(10, 12, kernel_size=(25, 1)),
-            # nn.LeakyReLU(0.3, inplace=True),
+            nn.LeakyReLU(0.3, inplace=True),
             nn.Dropout(0.4),
 
             nn.Conv2d(12, 12, kernel_size=(1, 7), stride=(1, 1), padding=(0, 1)),
             nn.BatchNorm2d(12),
-            # nn.LeakyReLU(0.3, inplace=True),
+            nn.LeakyReLU(0.3, inplace=True),
             nn.MaxPool2d(kernel_size=(2, 1)),
         )
 
